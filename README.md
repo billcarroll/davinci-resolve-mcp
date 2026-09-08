@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-[![Version](https://img.shields.io/badge/version-2.207.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.212.4-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
 [![Tools](https://img.shields.io/badge/MCP%20Tools-36%20(353%20full)-blue.svg)](#server-modes)
@@ -280,6 +280,17 @@ reviewable audit artifact with the same summary, defaulting to
 it instead — alongside a conform in a dated TransferFiles folder, say — and
 creates the directories to get there, so check the path before you send it.
 An existing file is never replaced without `overwrite: true`.
+`inspect_operation(tool?, target_action?, target_params?)` evaluates pre-flight
+risk level (`low`, `medium`, `high`, `critical`), destructive potential, and blast
+radius (`item`, `track`, `timeline`, `project`, `system`) before taking action, while
+`list_lifecycle_hooks()` inspects active execution interceptors.
+
+It is a heuristic over action names, not a simulation — it never touches the
+project and does not validate your parameters, so `recognised: false` means the
+levels are defaults rather than a finding, and `snapshot_available: null` means
+rollback availability was not determined rather than absent. Every shipped hook
+observes; none replaces a tool's result, so `dry_run` always reaches the real
+handler and nothing synthesises a preview for an action that has none.
 
 A report for a run where nothing was verified says **"not established — no
 checks recorded"**, not "passed". Absence of evidence is a question still open,
@@ -328,7 +339,7 @@ cheaper to read it here than to discover it mid-project.
 | Not supported | Why, and what you get instead |
 |---|---|
 | **Choosing the best take** | Performance is most of what makes a take right, and none of it is measurable from a waveform or a transcript. `rank_takes` ranks *fluency* — fillers, restarts, script coverage — and says so in every response. The take that plays is regularly the least fluent one, because the hesitation is often the acting. Use it to find the clean safety take, not to choose the read. |
-| **Cutting to music** | No beat or downbeat detection yet. Speech-driven tools will read a music bed as one long region and are the wrong instrument for it. |
+| **Automatic music editing** | Optional `librosa` support provides beat detection and beat/bar/phrase cut-point plans, not a finished assembly. Downbeats are inferred from the first beat; use `beat_offset` for pickups. Speech-silence tools are unsuitable for finding musical edit points. |
 | **Judging a cut** | Nothing here has an opinion about whether an edit is good. Every destructive action is plan → review → confirm for that reason. |
 | **Replacing an editor** | The output is a first-pass assembly, in the assistant-editor sense: ingest, sync, organize, string out, flag problems. It is a starting point you cut, not a finished cut. Defaults are deliberately **generous** — a first assembly is supposed to run long, because trimming is fast and visible while recovering discarded material is slow and invisible. |
 | **Modifying your source media** | By design and without exception — see below. |

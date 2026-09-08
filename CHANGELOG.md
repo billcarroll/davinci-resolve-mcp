@@ -2,6 +2,470 @@
 
 Release history for the DaVinci Resolve MCP Server. The latest release is summarized in the root README; older entries live here to keep the README focused.
 
+## What's New in v2.212.4 — both dependency manifests move together again
+
+### Changed
+
+- **The root `package.json` had lagged `resolve-advanced/package.json` since
+  July.** The advanced manifest was brought to zero advisories on 2026-08-30;
+  the root one still carried the SDK at 1.27, adm-zip 0.5, sharp 0.33, zod 3
+  and uuid 9, so `npm audit` on the root read nine advisories (five high)
+  while the advanced package read one. Both manifests now agree:
+  `@modelcontextprotocol/sdk` 1.30, `fast-xml-parser` 5.11, `adm-zip` 0.6,
+  `sharp` 0.35, `zod` 4, `js-yaml` 4.3, `pg` 8.23, `better-sqlite3` held on
+  the 11.x line. Contributed in #193 by @federicosada-pixel.
+- **`uuid` is gone from the root manifest.** Nothing under `bin/`, `src/` or
+  `scripts/` imports it — the code uses `crypto.randomUUID` — so rather than
+  carry the bump to 14.x it was removed on landing.
+- **Python floor for the MCP SDK is now `mcp[cli]>=1.30,<2`** in
+  `requirements.txt` and the installer; the `<2` pin stays because the 2.x
+  SDK dropped `mcp.server.fastmcp`. `pyaaf2` floor moves to 1.7.1.
+
+### What was checked
+
+- **zod 3 → 4 is a major bump the advanced server takes directly.** Its two
+  single-argument `z.record()` sites (a documented zod 4 removal) were probed
+  on zod 4.5.4 for both parsing and JSON-schema conversion, and a real stdio
+  `tools/list` returns the same 18 tools before and after.
+- **The five remaining root advisories are all transitive under the MCP
+  SDK** — hono, @hono/node-server, ajv → fast-uri, express-rate-limit →
+  ip-address, express → qs — and `npm audit fix --dry-run` reports the same
+  five, so they clear only when the SDK bumps its own dependencies.
+- The Python suite was also run with the 1.30.0 SDK wheel shadowing the venv
+  before the venv itself was upgraded.
+
+### Validation
+
+- Full offline Python suite, the drift guards (including the lockfile-sync
+  guard), `npm ci` from both lockfiles, the advanced Node suite, the CLI
+  smoke and pack checks, and pip-audit on the upgraded venv. No Resolve
+  behavior changed; live test not required.
+
+## What's New in v2.212.3 — a cached update prompt is re-judged against the version actually running
+
+### Fixed
+
+- **A persisted "update available" outlived the upgrade it recommended.** The
+  update checker caches its last verdict (in memory and in
+  `logs/update-check.json`) and serves it without network for the throttle
+  interval. That verdict was stored as a *status*, not as a comparison, so
+  after upgrading from the version it was computed for — 2.135.0 → 2.210.0,
+  say — a server now running 2.212.1 kept prompting to update to 2.210.0.
+  Every cached path (in-memory, persisted, and the throttled branch of
+  `check_for_updates`) now re-compares the cached `latest_version` against
+  the running version and reclassifies to `update_available` /
+  `up_to_date` / `current_ahead`; `error` and `disabled` results are left
+  as they were. Contributed in #194 by @diesdaas.
+
+### Documentation
+
+- **The READMEs said there was no beat detection; there has been for some
+  time.** Both the English and Simplified Chinese "not supported" tables
+  claimed "no beat or downbeat detection yet" — twenty lines below an
+  optional-extras table listing `pip install librosa` for exactly that. The
+  row now describes what actually exists: optional `librosa` beat detection
+  and beat / bar / phrase cut-point plans, downbeats inferred from the first
+  beat with `beat_offset` for pickups, and cut *points* rather than a finished
+  music edit. Speech-silence tools remain the wrong instrument for music.
+
+### Validation
+
+- Four regression tests from the PR cover the persisted, in-memory and
+  throttled cache paths plus the preserved error/disabled states. On landing,
+  the update-check tests gained a `setUp` that resets the module-wide cache
+  around every test, so a seeded verdict cannot leak into another module's
+  cached-status read later in the run. Full offline suite, drift guards and
+  the advanced Node suite are green. No Resolve behavior changed; live test
+  not required.
+
+## What's New in v2.212.2 — failed verification evidence survives the operation envelope
+
+### Fixed
+
+- **A payload that carried its own `verification` block won outright, hiding
+  contradicting evidence beside it.** `extract_verification` returned any
+  pre-shaped `verification` dict untouched, so a top-level `contradiction:
+  true`, a `readback.missing` list, or a failed check inside the block itself
+  could sit next to `status: "passed"`. Evidence now merges: the explicit
+  status, readback misses, post-state readback and property-restore failures
+  are all collected, and precedence runs contradiction > failed > partial >
+  passed > unverified. Contributed in #195 by @denoise.
+- **Bulk command counts no longer count as verification.** `succeeded` /
+  `failed` tallies record what the server sent, not what Resolve honoured; a
+  `succeeded: 3, failed: 0` result used to read `verification.status:
+  "passed"` with no readback at all. The counts still drive the envelope's
+  own `status` (`partial` when both are non-zero), but the verification block
+  stays `unverified` until real evidence — a readback — arrives.
+
+### Validation
+
+- The PR's regression tests plus two added on landing: bulk counts cannot
+  mask a failed readback, and readback evidence is what establishes a pass on
+  a bulk result. Full offline suite, the drift guards and the advanced Node
+  suite are green. No Resolve behavior changed; live test not required.
+
+## What's New in v2.212.1 — the networked transport's generated bearer token no longer lands in server.log
+
+### Fixed
+
+- **A generated transport token was written to `logs/server.log` in cleartext (CWE-532).**
+  Starting `--transport sse` or `--transport streamable-http` without pinning
+  `$DAVINCI_MCP_TOKEN` logged the fresh token verbatim. The transport logger
+  has no handler of its own, so the record propagated to the root logger,
+  which `src/server.py` points at `logs/server.log` — opened with the default
+  file mode (0644 under the usual umask), appended to forever, and never
+  cleared. That copy was strictly less protected and strictly more durable
+  than the one the code deliberately locks down: the 0600 state file under
+  the per-user private directory, deleted in `run_networked`'s `finally`. The
+  token is the transport's only access control, and the control panel's
+  sibling token was already kept out of argv and logs against exactly this
+  local-user threat. The log line now names the state file's path instead of
+  the value, and a generated token is echoed only to an interactive stderr
+  (a redirected stderr is another file). The state file remains the
+  hand-back channel the control panel already reads. Reported privately by an
+  external security researcher, with a reproduction against the real
+  `run_networked` and the server's real root-logger configuration.
+
+### Documentation
+
+- `SECURITY.md` now states the rule outright: the pidfile and the transport
+  state file are the only on-disk copies of either token, and neither is
+  written to `logs/server.log`. The `mcp_transport` module docstring no longer
+  says the token is "logged at startup".
+
+### Validation
+
+- A regression test runs the real `run_networked` (uvicorn stubbed) with a
+  root `FileHandler` configured the way `src/server.py` configures it, and
+  asserts the token is absent from the file, the state-file path is present,
+  a redirected stderr never carries it, an interactive stderr carries it
+  exactly once, and a pinned token is echoed nowhere. Against the previous
+  code the test fails with the token found in the log — the reporter's
+  finding, reproduced.
+
+## What's New in v2.212.0 — graph risk follows the graph the call targets
+
+### Changed
+
+- **Every `graph` mutation now reports the blast radius of its `source`.**
+  The graph tool resolves `source` as `"timeline"` (the DEFAULT, the
+  timeline-level node graph), `"item"` (one clip), or
+  `"color_group_pre"`/`"color_group_post"` (a group's shared graph), and every
+  mutation lands on whichever graph that names. The classifier reported all
+  five graph actions as item-scoped regardless, so `reset_all_grades` on a
+  color-group graph — which wipes the grade of every clip in the group — read
+  as one item. The radius is now derived from the call: timeline, item, or
+  project for a color group, and the reasons name the target graph.
+
+- **`graph.set_lut` and `graph.apply_arri_cdl_lut` are HIGH on the timeline or a color-group graph, MEDIUM on one item.**
+  A plain `set_lut` call with no `source` restyles every clip on the timeline;
+  rating that MEDIUM under-stated it, while rating the item-scoped call HIGH
+  would over-block a one-clip LUT. Safe mode now blocks the broad cases
+  unless `allow_risky_operation=true`; the item case passes as before.
+  `reset_all_grades` and `apply_grade_from_drx` stay HIGH, `set_node_enabled`
+  stays LOW — only their reported scope changed.
+
+### Added
+
+- Tests: safe mode blocks broad LUT writes before the handler and allows
+  item-scoped ones; the classifier's LUT split; the radius of every graph
+  action across all five source values; and a medium-band matrix pinning
+  every remaining MEDIUM destructive action as recognised, destructive, not
+  confirmation-gated, and carrying its reviewed radius.
+
+- Adapted from PR #192 by @Rohitkanithi, which introduced the scope split
+  and its tests for the two LUT actions; landed with the radius generalised
+  to every graph action, since the same `source` governs them all.
+
+## What's New in v2.211.0 — dry_run on an action that cannot honour it now refuses instead of executing
+
+### Changed
+
+- **An explicit `dry_run=true` on a destructive action with no native dry-run path is refused, not executed.**
+  102 of the 108 registered destructive actions never read the flag, so
+  `timeline_markers.add` with `dry_run=true` added a real marker and
+  `timeline.delete_track` with `dry_run=true` deleted the track — and the
+  agent guidance says to prefer `dry_run` where it exists, which cannot be
+  told from outside. The destructive-operation wrapper now returns
+  `DRY_RUN_UNAVAILABLE` (`status: dry_run_unavailable`, `dry_run: true`,
+  `simulated: false`, `executed: false`, the same static risk block as
+  `inspect_operation`, and a remediation) before any archive, state lookup,
+  or handler execution. The security audit log records it as
+  `blocked` / `dry_run_unavailable`. This is a refusal, not a synthesised
+  preview — the lifecycle pipeline's original interceptor answered
+  `success: true` for calls it never ran and was removed for it.
+
+- **The six actions that do honour `dry_run` are an allowlist, `NATIVE_DRY_RUN_ACTIONS`.**
+  `media_pool.set_clip_marks`, `media_pool.clear_clip_marks`,
+  `media_pool.setup_multicam_timeline`, `timeline.apply_cuts`,
+  `timeline.ripple_insert`, `timeline_ai.create_subtitles`. A static drift
+  test pins the list to the handlers by following the params object into
+  helper calls; that is what excluded `edit_engine.execute_tighten` and
+  `execute_silence_ripple`, which call a dry_run-aware helper but hand it a
+  fresh dict without the flag. Add a native dry-run branch and the test says
+  to list it; list an action without one and the test refuses.
+
+- **The refusal is keyed on registry membership, not on `is_destructive()`**, so
+  the no-archive filters (a Notes edit) cannot let a dry-run request through to
+  a handler that would execute it.
+
+- Adapted from PR #190 by @Rohitkanithi, which introduced the refusal shape
+  as a denylist of the fourteen marker actions; landed as an allowlist so the
+  other 88 actions that ignore the flag are covered too.
+
+## What's New in v2.210.1 — frame capture and verify_output no longer read JobStatus in English
+
+### Fixed
+
+- **Single-frame capture failed with `RENDER_FAILED` on every non-English Resolve (issue #191).**
+  `GetRenderJobStatus()["JobStatus"]` is a localized display string — `"Concluso"`
+  on an Italian install — and the capture gate compared it to the English word,
+  so a finished render with the file already on disk reported "Render did not
+  complete". Completion is now decided by `_render_job_completed()` on
+  `CompletionPercentage` and `Error`, which are locale-independent, with the
+  file-written check as the real proof. `render.verify_output` carried the same
+  comparison in its "not Complete" warning and its missing-file warning; both
+  use the same rule now, so a localized finished job verifies and a localized
+  failed job still does not. Reported with an exact API readback by
+  @gabrieleleonardi-sya.
+
+### Documentation
+
+- New API truth entry for the localized `JobStatus` field, submitted to the
+  Blackmagic-facing report as a missing locale-independent status code, and a
+  regenerated `docs/reference/api-limitations.md`.
+
+### Validation
+
+- Unit tests cover the reporter's readback (`Concluso` at 100%), a localized
+  failed job carrying `Error`, and a localized incomplete job without one; the
+  English fast path is unchanged. No localized Resolve is available on the
+  release machine, so the live evidence is the reporter's session on Studio
+  21.0.2.4.
+
+## What's New in v2.210.0 — every destructive action now carries a real risk rating
+
+### Changed
+
+- **All 108 registered destructive actions are classified; 80 of them were not.**
+  Safe mode blocks established HIGH and CRITICAL, and the classifier's `else`
+  branch returns MEDIUM with `risk_established: false` — an honest "no rule
+  matched", but not something a gate can act on. So `timeline.move_clips`,
+  `timeline.ripple_insert`, `timeline.create_compound_clip`,
+  `timeline.import_into_timeline`, `graph.apply_grade_from_drx`,
+  `timeline_item_color.copy_grades`, `timeline_item_takes.finalize` and the
+  three `edit_engine` plan executors all passed a gate that was meant to stop
+  them. Safe mode now gates 35 actions where it previously gated 20.
+
+  Every rating was taken from the action's handler rather than its name, since
+  the name heuristic is the thing being replaced. Two results worth calling out:
+
+  - `timeline.move_clips` passes `delete_sources=True` to the duplicate helper,
+    so it removes the originals — it is a deletion wearing a move's name.
+  - `timeline_item.update_sidecar` is the only registered action that writes
+    **outside the project**: it rewrites the `.braw` sidecar or R3D `.RMD` file
+    next to the camera original. No Resolve undo reaches it, and it changes how
+    that media reads in every other application. Rated HIGH.
+
+  New distribution across the 108: 2 critical, 33 high, 35 medium, 38 low.
+
+- **`MEDIUM` now means something.** It was overwhelmingly the fallthrough, so an
+  assessed MEDIUM and an unrated action were indistinguishable by level alone. A
+  `_MEDIUM_RISK_ACTIONS` table makes it a finding, and `risk_established`
+  separates the two everywhere risk is reported.
+
+### Fixed
+
+- **The operator's saved `setup` defaults decided what the test suite did.**
+  `logs/media-analysis-preferences.json` holds real defaults including
+  `destructive.safe_mode`. Tests that call `setup` already overrode the path,
+  but the other three thousand read it — so with safe mode left enabled on a
+  machine, seventeen tests across `test_cut_executor`, `test_keyed_param_guards`,
+  `test_media_pool_changes`, `test_media_pool_delete_governance` and
+  `test_delete_clips_readback_retry` failed with "Safe mode blocked
+  critical-risk action". A red suite produced by a setting rather than by the
+  code, and it would have looked exactly like a regression in this release.
+
+  `tests/offline_guard` now redirects the preferences path for the whole run,
+  alongside the audit-log redirect added in v2.209.1. Pinned by a test asserting
+  the active path is never the operator's file, and by one asserting the guard
+  names the same environment variable the server reads — a mismatch there would
+  fail open and silently.
+
+### Added
+
+- **A guard test asserting no registered destructive action is unrated**, so a
+  newly registered action cannot silently rejoin the ungated set — which is how
+  the 80 accumulated. Registering an action and rating it are now one commit.
+- **A test pinning that `inspect_operation` and the safe-mode gate report the
+  same level** for all 108 actions. They read one classifier; the failure mode
+  if they ever diverge is silent.
+
+Live-validated against DaVinci Resolve Studio 19.1.3.7: the four newly-HIGH
+actions probed are refused with the timeline unchanged, the newly LOW/MEDIUM
+ones still pass, and every audit row carries `risk_established: true`.
+
+## What's New in v2.209.1 — the test suite no longer writes to the security audit log
+
+### Fixed
+
+- **Running the suite appended fabricated events to `logs/security-audit.jsonl`.**
+  The destructive-op audit log added in v2.209.0 defaults to that path, which is
+  correct for an install and wrong for a test run: any test exercising a
+  `@destructive_op`-wrapped handler wrote a genuine-looking record.
+  `tests/test_tool_argument_validation` walks every tool, so a single run added
+  24 synthetic `delete_timelines` / `reset_all_grades` / `apply_cuts` entries,
+  and repeated runs accumulated 216.
+
+  A security log is read to establish what actually happened, so synthetic rows
+  in it are worse than a missing feature — at the point someone needs to trust
+  the file they are indistinguishable from real events. `tests/offline_guard`
+  now redirects the audit path to a temp file for the whole run, covering both
+  the pytest and `python -m unittest` entry points, and only replaces the
+  *default*: a test that configures `destructive.audit_log_path` still gets its
+  own path. A regression test asserts the active path is never inside the repo.
+
+  No released behaviour changes — the default remains `logs/security-audit.jsonl`
+  for real installs. Anyone who ran the v2.209.0 suite should expect synthetic
+  rows in their local file; they carry temp-directory `project_root` values.
+
+## What's New in v2.209.0 — safe operations policy
+
+### Added
+
+- **Destructive operations now carry explicit security metadata** — wrapped
+  destructive tool calls receive an `operation_id` plus a `security` block with
+  a `risk_level` (`low`, `medium`, `high`, or `critical`) and a
+  `risk_established` flag. The existing version-on-mutate and confirm-token
+  gates stay intact, but callers now have a stable policy surface to inspect
+  and display before or after a Resolve mutation.
+
+  Levels come from the same classifier that backs pre-flight
+  `inspect_operation`, so the gate and the inspection surface cannot disagree
+  about a call. `risk_established` is false when the classifier matched no rule
+  and the level is a name-based default rather than a finding — true today for
+  80 of the 108 registered destructive actions, which is a gap to close by
+  classifying them, not by gating them.
+- **Safe mode blocks high-risk destructive calls when enabled** —
+  `setup(action="set_defaults", params={"destructive": {"safe_mode": true}})`
+  blocks `high` and `critical` actions before the underlying Resolve handler
+  runs. Reviewed one-off calls can proceed with `allow_risky_operation=true`.
+  Unclassified actions are reported, not blocked.
+- **Security audit JSONL for destructive calls** — allowed, blocked, and
+  pending-confirmation destructive calls write audit events to
+  `logs/security-audit.jsonl` by default. Confirmation tokens are redacted in
+  the audit payload.
+
+### Changed
+
+- **Risk classification is now one table, not two** — the marker and
+  clip-colour actions classify as `low` instead of falling through the name
+  heuristic as unrecognised `medium`, and `timeline.lift_range`,
+  `timeline.overwrite_range`, `timeline.apply_cuts`, `timeline.delete_track`,
+  `media_pool.delete_folders` and `graph.reset_all_grades` are now classified
+  `high` wherever risk is reported, including pre-flight inspection.
+- **`setup` exposes destructive defaults** — `destructive.require_confirm_token`,
+  `destructive.safe_mode`, `destructive.audit_log`, and
+  `destructive.audit_log_path` are now visible through `schema`, persisted by
+  `set_defaults`, and reset by `clear_defaults`.
+
+## What's New in v2.208.1 — #188: variant item counts come from the timeline
+
+### Fixed
+
+- **A silence ripple under-reported what it built, by exactly half.**
+  `execute_silence_ripple` returned `variant_video_items: 250` and
+  `variant_audio_items: 250` for a variant that really held 432 of each. The
+  bridge's `ResolveOperations._encode` truncated every proxied container to
+  `max_items` (500) with no signal anywhere, and `plan_silence_ripple`
+  interleaves video and audio — so a 432-range plan became 864 clipInfos in one
+  `AppendToTimeline`, Resolve placed and returned all 864, and the first 500
+  encoded are precisely 250 video plus 250 audio. The same response's
+  `readback.after.clip_count` said 864 and was right the whole time, because it
+  re-reads per track: two numbers from two sources in one payload, one of them
+  silently short. "Planned 432, got 250" reads exactly like 182 ranges failing
+  to land, which on a silence ripple is the operator's central fear, and
+  establishing that it was benign cost a full review cycle of hand-auditing
+  both tracks. Reported and fixed in #188 by @mart0vip.
+- **Dropped elements are now reported, never silent.** `op_call` and
+  `op_get_attribute` carry a `truncated` block naming the count, limit and
+  containers; the client records it on `transport.truncations` and logs the
+  method. It warns rather than raises deliberately — the native call has
+  already run by the time the reply is encoded, so raising would turn a
+  completed 864-item assembly into an error and orphan the timeline. A short
+  list that looks complete was the failure mode; the bound itself is
+  legitimate.
+- **The item ceiling no longer exceeds the handle table.** `max_items` was
+  clamped to 5000 against a 4096-entry `MAX_HANDLES`, so a long enough list
+  evicted its own earliest handles while it was still being minted and handed
+  the client ids that were already `stale_handle`. It now clamps to
+  `MAX_HANDLES`, with the default raised 500 → 2000.
+- **Counts come from the timeline, not the append reply.**
+  `create_variant_from_ranges` reports `placed_item_counts` from the
+  post-assembly per-track re-read it was already taking for gap detection — no
+  extra Resolve calls — and `execute_silence_ripple` and `execute_tighten` now
+  share one accounting helper, tighten having carried the identical bug. A
+  planned-vs-placed disagreement is stated outright instead of left to a hand
+  audit.
+- Beyond reporting: under the old ceiling a `cdl` applied to a large variant
+  only reached the first 250 video items.
+
+## What's New in v2.208.0 — agent execution lifecycle & pre-flight risk inspection
+
+Adapted from the design contributed in PR #187.
+
+### Added
+
+- **Agent execution lifecycle pipeline & hooks:**
+  Tools passing through `_guard_missing_params` now execute within a structured
+  lifecycle pipeline, supporting pre-flight inspection (`before_tool_call`),
+  post-execution enrichment (`after_tool_call`), and failure handling (`on_error`).
+- **Pre-flight operation risk & blast radius assessment:**
+  `resolve_control(action="inspect_operation")` evaluates any tool and action
+  prior to execution, returning risk levels (`low`, `medium`, `high`, `critical`),
+  destructive flags, confirmation requirements, and blast radius scopes (`item`,
+  `track`, `timeline`, `project`, `system`).
+- **Lifecycle hooks introspection:**
+  `resolve_control(action="list_lifecycle_hooks")` exposes registered pipeline
+  hooks and their active states.
+
+### Notes on the adaptation
+
+- **The dry-run simulation interceptor is not included.** As contributed, any
+  call carrying `dry_run: true` outside a hardcoded four-entry allowlist was
+  short-circuited and answered with a synthesised `{"success": true,
+  "simulated": true}`. `src/server.py` has 273 `dry_run` references, so the
+  allowlist was not close: `setup.set_defaults` and
+  `resolve_control.clear_executions` both have real, tested dry-run paths and
+  were hijacked. It also answered `success: true` to
+  `set_defaults(result_envelope="banana")` — a dry run of an operation that
+  cannot succeed — and to adding a marker with no timeline in existence.
+  `dry_run` is the call an editor makes *because* they do not trust the next
+  one; a version of it that always succeeds is worse than none, because it is
+  believed. Nothing about dry-run behaviour changes in this release: every
+  `dry_run` reaches the handler that owns it.
+- **The pipeline can gate a call, but nothing shipped does.**
+  `HookDecision(proceed=False)` and the public `register_hook` remain, so a
+  deliberately registered hook can intercept. Every default hook only observes,
+  and `test_no_default_hook_short_circuits` keeps it that way.
+- **`inspect_operation` no longer contradicts itself about rollback.** It
+  reported `snapshot_available` two ways in one response — `false` inside
+  `risk`, and `true` at the top level whenever any pre-state could be read.
+  Reading a project name is not a restorable snapshot. It is now a single
+  `null`, meaning "not determined", with `pre_state_available` reporting
+  separately whether live state was read at all.
+- **An unrecognised operation is no longer assessed as safe.** Any action
+  matching no rule fell into a general-mutation bucket and returned `medium` /
+  `destructive: false` / `confirmation_required: false` — a confident answer
+  about an operation the classifier had never heard of, including ones that do
+  not exist. Responses now carry `recognised: false` and say in `reasons` that
+  the levels are name-based defaults rather than a finding. The guard exists
+  for hallucinated calls; answering one with reassurance was the failure it was
+  built to prevent.
+- The docs now state plainly that `inspect_operation` is a heuristic over
+  action names, not a simulation: it never touches the project and does not
+  validate parameters.
+
 ## What's New in v2.207.0 — execution audit report exports
 
 Contributed in PR #185.

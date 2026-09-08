@@ -11,7 +11,7 @@ Usage:
     python src/server.py --full       # Start the 353-tool granular server instead
 """
 
-VERSION = "2.207.0"
+VERSION = "2.212.4"
 
 import base64
 import os
@@ -75,6 +75,11 @@ from src.utils.execution_trace import (
     end_execution,
     clear_executions,
     export_execution_report,
+)
+from src.utils import execution_lifecycle as _execution_lifecycle
+from src.utils.execution_lifecycle import (
+    inspect_operation,
+    list_lifecycle_hooks,
 )
 from src.utils.render_ids import (
     render_codec_id_from_codecs as _render_codec_id_from_codecs,
@@ -887,6 +892,37 @@ def _try_connect():
             resolve = None
             return None
 
+def _get_resolve_lifecycle_state() -> Optional[Dict[str, Any]]:
+    """Capture non-blocking pre-flight Resolve project and timeline metadata."""
+    global resolve
+    r = resolve
+    if r is None:
+        try:
+            r = _try_connect()
+        except Exception:
+            r = None
+    if r is None:
+        return None
+    try:
+        pm = r.GetProjectManager()
+        if not pm:
+            return None
+        proj = pm.GetCurrentProject()
+        if not proj:
+            return None
+        state: Dict[str, Any] = {"project_name": proj.GetName()}
+        tl = proj.GetCurrentTimeline()
+        if tl:
+            state["timeline_name"] = tl.GetName()
+            state["duration_frames"] = tl.GetEndFrame() - tl.GetStartFrame()
+            state["track_count_video"] = tl.GetTrackCount("video")
+            state["track_count_audio"] = tl.GetTrackCount("audio")
+        return state
+    except Exception:
+        return None
+
+_execution_lifecycle.get_lifecycle_pipeline().set_state_provider(_get_resolve_lifecycle_state)
+
 def _launch_resolve(headless: Optional[bool] = None):
     """Launch DaVinci Resolve and wait for it to become available.
 
@@ -1212,7 +1248,12 @@ def _ai_governance_gate(op: str, p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _destructive_preference_provider(key: str) -> Any:
     """Reader for C6 preferences out of the existing media-analysis prefs file."""
     try:
-        return _read_media_analysis_preferences().get(key)
+        prefs = _read_media_analysis_preferences()
+        if key.startswith("destructive."):
+            destructive = prefs.get("destructive")
+            if isinstance(destructive, dict):
+                return destructive.get(key.split(".", 1)[1])
+        return prefs.get(key)
     except Exception:
         return None
 
@@ -1501,6 +1542,7 @@ _TRACE_OBSERVER_ACTIONS = {
     "get_execution_trace", "get_execution", "list_recent_executions",
     "clear_executions", "begin_execution", "end_execution",
     "export_execution_report",
+    "inspect_operation", "list_lifecycle_hooks",
 }
 
 
@@ -1573,14 +1615,29 @@ def _guard_missing_params(fn):
         async def wrapper(*args, **kwargs):
             action = _guarded_action_name(args, kwargs)
             params = _guarded_params(args, kwargs)
+            lifecycle = _execution_lifecycle.get_lifecycle_pipeline()
+            ctx = _execution_lifecycle.ToolCallContext(
+                tool_name=tool_name,
+                action=action,
+                params=params or {},
+            )
+            decision = lifecycle.run_before(ctx)
+            if decision and not decision.proceed and decision.short_circuit_result is not None:
+                return _build_operation_envelope(tool_name, action, params, decision.short_circuit_result, duration_ms=0)
+
             t0 = time.perf_counter()
             try:
                 result = await fn(*args, **kwargs)
             except _MissingParam as exc:
                 result = _missing_param_error(exc, action)
+            except Exception as exc:
+                duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
+                lifecycle.run_on_error(ctx, exc, duration_ms)
+                raise
             duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
             enveloped = _build_operation_envelope(
                 tool_name, action, params, result, duration_ms=duration_ms)
+            enveloped = lifecycle.run_after(ctx, enveloped, duration_ms)
             _record_execution_step(tool_name, action, params, result, enveloped, duration_ms)
             return enveloped
     else:
@@ -1588,14 +1645,29 @@ def _guard_missing_params(fn):
         def wrapper(*args, **kwargs):
             action = _guarded_action_name(args, kwargs)
             params = _guarded_params(args, kwargs)
+            lifecycle = _execution_lifecycle.get_lifecycle_pipeline()
+            ctx = _execution_lifecycle.ToolCallContext(
+                tool_name=tool_name,
+                action=action,
+                params=params or {},
+            )
+            decision = lifecycle.run_before(ctx)
+            if decision and not decision.proceed and decision.short_circuit_result is not None:
+                return _build_operation_envelope(tool_name, action, params, decision.short_circuit_result, duration_ms=0)
+
             t0 = time.perf_counter()
             try:
                 result = fn(*args, **kwargs)
             except _MissingParam as exc:
                 result = _missing_param_error(exc, action)
+            except Exception as exc:
+                duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
+                lifecycle.run_on_error(ctx, exc, duration_ms)
+                raise
             duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
             enveloped = _build_operation_envelope(
                 tool_name, action, params, result, duration_ms=duration_ms)
+            enveloped = lifecycle.run_after(ctx, enveloped, duration_ms)
             _record_execution_step(tool_name, action, params, result, enveloped, duration_ms)
             return enveloped
 
@@ -6539,6 +6611,26 @@ def _variant_item_placement(item) -> Dict[str, Any]:
     }
 
 
+def _snapshot_track_item_counts(snapshot: Dict[str, Any]) -> Dict[str, int]:
+    """Per-track-type item counts read from a conform snapshot of a live timeline.
+
+    This is the ONLY honest answer to "what did the assembly actually place".
+    The obvious alternative — counting what `MediaPool.AppendToTimeline`
+    returned — is a witness derived from the same call it would be checking, and
+    it lies in two measured ways: the in-app bridge caps any proxied list at
+    `max_items` (an 864-clipInfo append came back as 500 items, so a variant
+    holding 432 video + 432 audio was reported as 250 + 250), and Resolve drops
+    colliding records from the reply without an error (see the api_truth entry
+    "MediaPool.AppendToTimeline (overlapping records — earlier item wins)").
+    Re-reading the timeline per track cannot be fooled by either.
+    """
+    counts: Dict[str, int] = {}
+    for track_type, block in (snapshot.get("tracks") or {}).items():
+        rows = (block or {}).get("tracks") or []
+        counts[str(track_type)] = sum(int(row.get("item_count") or 0) for row in rows)
+    return counts
+
+
 def _variant_audio_summary(built):
     """Video/audio range counts for an assembled variant, warning when it carries
     no audio. create_variant_from_ranges places exactly the ranges given, so a
@@ -6549,6 +6641,61 @@ def _variant_audio_summary(built):
     if audio == 0:
         summary["warning"] = "video-only (no audio): add ranges with track_type='audio' to carry sound"
     return summary
+
+
+def _variant_audio_accounting(variant: Dict[str, Any], *, planned_video: int,
+                              planned_audio: int) -> Dict[str, Any]:
+    """The planned-vs-placed block on a tighten / silence-ripple readback.
+
+    Shared by execute_tighten and execute_silence_ripple so the two cannot
+    drift: they answer the same operator question, "did every range I planned
+    actually land in the variant".
+
+    Placed counts come from the assembler's post-assembly re-read of the
+    timeline, never from what `AppendToTimeline` returned — see
+    `_snapshot_track_item_counts` for why the append's reply is not evidence.
+    A count that is short for a *reporting* reason and a count that is short
+    because material was dropped must never look the same here: on a silence
+    ripple the operator's whole fear is dropped material, so a disagreement is
+    stated outright rather than left to be discovered by hand-auditing tracks.
+    """
+    placed = variant.get("placed_item_counts")
+    video = (placed or {}).get("video")
+    audio = (placed or {}).get("audio")
+    accounting: Dict[str, Any] = {
+        "planned_audio_ranges": planned_audio,
+        "planned_video_ranges": planned_video,
+        "variant_audio_items": audio,
+        "variant_video_items": video,
+        "counts_source": "post-assembly per-track read of the variant timeline",
+    }
+    if video is None or audio is None:
+        accounting["note"] = (
+            "Placed item counts are UNAVAILABLE — the variant could not be re-read "
+            "after assembly. Verify with timeline_item get_items_in_track before "
+            "using this variant."
+        )
+        return accounting
+    disagreements = []
+    if video != planned_video:
+        disagreements.append(f"video {video}/{planned_video}")
+    if audio != planned_audio:
+        disagreements.append(f"audio {audio}/{planned_audio}")
+    if disagreements:
+        accounting["note"] = (
+            "PLACED COUNT DISAGREES WITH THE PLAN (placed/planned: "
+            + ", ".join(disagreements)
+            + ") — ranges did not land. Resolve drops colliding records from an "
+            "append without erroring; check readback.gaps_overlaps and the "
+            "tracks themselves before using this variant."
+        )
+    elif planned_audio:
+        accounting["note"] = "Variant carries audio mirrored from the video cuts."
+    else:
+        accounting["note"] = (
+            "Variant is VIDEO-ONLY (silent) — re-plan with include_audio=True for sound."
+        )
+    return accounting
 
 
 def _timeline_create_variant_from_ranges(proj, source_tl, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -6701,16 +6848,21 @@ def _timeline_create_variant_from_ranges(proj, source_tl, p: Dict[str, Any]) -> 
     if p.get("cdl"):
         target_ids = [row.get("timeline_item_id") for row in items_out if row.get("timeline_item_id") and row.get("range", {}).get("media_type") == 1]
         look_result = _timeline_apply_look_to_items(new_tl, {"target_ids": target_ids, "cdl": p.get("cdl")})
+    # One snapshot, two consumers: gap detection and the placed-item counts.
+    # `items` above is only as complete as the append's REPLY, so it is not
+    # evidence of what landed — `placed_item_counts` re-reads the timeline.
+    snapshot = _timeline_conform_snapshot(new_tl, {})
     return {
         "success": True,
         "name": new_tl.GetName(),
         "id": new_tl.GetUniqueId(),
         "items": items_out,
+        "placed_item_counts": _snapshot_track_item_counts(snapshot),
         "placement_mismatches": placement_mismatches,
         "audio": _variant_audio_summary(built),
         "markers": marker_results,
         "look": look_result,
-        "gaps_overlaps": _detect_gaps_overlaps_from_snapshot(_timeline_conform_snapshot(new_tl, {}), {}),
+        "gaps_overlaps": _detect_gaps_overlaps_from_snapshot(snapshot, {}),
     }
 
 
@@ -14678,6 +14830,28 @@ def _playhead_frame_preview(tl, p: Dict[str, Any]):
             _restore_playhead(tl, original_tc, what="the thumbnail capture")
 
 
+def _render_job_completed(status: Optional[Dict[str, Any]]) -> bool:
+    """Whether GetRenderJobStatus says the job finished — without reading English.
+
+    JobStatus is a localized display string that follows the application
+    language: "Complete" on an English install, "Concluso" on an Italian one
+    (issue #191). Comparing it to the English literal fails every non-English
+    Resolve with an error that says the opposite of what happened. The
+    locale-independent signals are CompletionPercentage (numeric) and Error
+    (populated on a failed job), so those decide; the English literal is kept
+    only as a fast path for the common case.
+    """
+    status = status or {}
+    if str(status.get("JobStatus") or "") == "Complete":
+        return True
+    if status.get("Error"):
+        return False
+    try:
+        return float(status.get("CompletionPercentage")) >= 100
+    except (TypeError, ValueError):
+        return False
+
+
 def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
     """Render exactly one frame — the only frame-accurate capture route.
 
@@ -14799,9 +14973,14 @@ def _playhead_frame_render(proj, tl, p: Dict[str, Any]):
             time.sleep(0.25)
             waited += 0.25
         status = _ser(proj.GetRenderJobStatus(job)) or {}
-        if status.get("JobStatus") != "Complete":
+        # Localized JobStatus ("Concluso" on an Italian install, issue #191)
+        # cannot be compared to the English word; the file check below is the
+        # real proof anyway.
+        if not _render_job_completed(status):
             return _err(
-                f"Render did not complete: {status.get('JobStatus')}",
+                f"Render did not complete: JobStatus {status.get('JobStatus')!r} "
+                f"at {status.get('CompletionPercentage')}%"
+                + (f" — {status.get('Error')}" if status.get("Error") else ""),
                 code="RENDER_FAILED", category="api_error",
                 state={"status": status, "frame": frame},
             )
@@ -15285,6 +15464,101 @@ def _setup_defaults_snapshot() -> Dict[str, Any]:
         "general": _setup_general_defaults(),
         "media_analysis": _setup_media_analysis_defaults(),
         "updates": _setup_updates_defaults(),
+        "destructive": _setup_destructive_defaults(),
+    }
+
+
+def _setup_destructive_defaults() -> Dict[str, Any]:
+    prefs = _read_media_analysis_preferences()
+    destructive = prefs.get("destructive") if isinstance(prefs.get("destructive"), dict) else {}
+    return {
+        "require_confirm_token": _setup_bool(destructive.get("require_confirm_token"), True),
+        "safe_mode": _setup_bool(destructive.get("safe_mode"), False),
+        "audit_log": _setup_bool(destructive.get("audit_log"), True),
+        "audit_log_path": destructive.get("audit_log_path") or os.path.join(project_dir, "logs", "security-audit.jsonl"),
+        "preferences_path": _media_analysis_preferences_path(),
+    }
+
+
+def _setup_set_destructive_defaults(destructive_defaults: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+    if not destructive_defaults:
+        return {"changed": False, "recognized": False}
+
+    alias_to_key = {
+        "require_confirm_token": "require_confirm_token",
+        "requireconfirmtoken": "require_confirm_token",
+        "confirm_token": "require_confirm_token",
+        "confirmtoken": "require_confirm_token",
+        "safe_mode": "safe_mode",
+        "safemode": "safe_mode",
+        "audit_log": "audit_log",
+        "auditlog": "audit_log",
+        "audit_log_path": "audit_log_path",
+        "auditlogpath": "audit_log_path",
+    }
+    requested: Dict[str, Any] = {}
+    for key, value in destructive_defaults.items():
+        normalized_key = alias_to_key.get(_setup_text_key(key).replace("_", ""))
+        if not normalized_key:
+            normalized_key = alias_to_key.get(_setup_text_key(key))
+        if normalized_key:
+            requested[normalized_key] = value
+    if not requested:
+        return {"changed": False, "recognized": False}
+
+    try:
+        preferences = _read_media_analysis_preferences_strict()
+    except ConfigParseError as exc:
+        return _err(f"Refusing to update destructive defaults: {exc}. The preferences file exists but is unparseable; fix or delete it to avoid wiping saved settings.")
+
+    before = _setup_destructive_defaults()
+    next_preferences = dict(preferences)
+    destructive = dict(next_preferences.get("destructive") if isinstance(next_preferences.get("destructive"), dict) else {})
+    updates: Dict[str, Dict[str, Any]] = {}
+
+    def clear_requested(raw: Any) -> bool:
+        return raw is None or (not isinstance(raw, bool) and _setup_text_key(raw) in _SETUP_CHOICE_CLEAR_VALUES)
+
+    for key, raw_value in requested.items():
+        if clear_requested(raw_value):
+            destructive.pop(key, None)
+            updates[key] = {"before": before.get(key), "after": _setup_destructive_defaults().get(key), "cleared": True}
+        elif key in {"require_confirm_token", "safe_mode", "audit_log"}:
+            normalized = _setup_bool(raw_value, before.get(key, False))
+            destructive[key] = normalized
+            updates[key] = {"before": before.get(key), "after": normalized}
+        elif key == "audit_log_path":
+            path = os.path.realpath(os.path.abspath(os.path.expanduser(str(raw_value))))
+            destructive[key] = path
+            updates[key] = {"before": before.get(key), "after": path}
+
+    if dry_run:
+        return {
+            "changed": True,
+            "recognized": True,
+            "updates": updates,
+            "before": before,
+            "after": {**before, **{key: row.get("after") for key, row in updates.items()}},
+            "dry_run": True,
+        }
+
+    updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for key, row in updates.items():
+        if not row.get("cleared"):
+            destructive[f"{key}_updated_at"] = updated_at
+        else:
+            destructive.pop(f"{key}_updated_at", None)
+    next_preferences["destructive"] = destructive
+    _write_media_analysis_preferences(next_preferences)
+    after = _setup_destructive_defaults()
+    return {
+        "changed": before != after,
+        "recognized": True,
+        "updates": updates,
+        "before": before,
+        "after": after,
+        "updated_at": updated_at,
+        "preferences_path": _media_analysis_preferences_path(),
     }
 
 
@@ -15799,6 +16073,25 @@ def _setup_clear_defaults(keys: Any, dry_run: bool) -> Dict[str, Any]:
             return result["media_analysis"]
         result["cleared"].extend(media_clear_keys[key] for key in media_payload)
 
+    destructive_clear_keys = {
+        "require_confirm_token": "destructive.require_confirm_token",
+        "safe_mode": "destructive.safe_mode",
+        "audit_log": "destructive.audit_log",
+        "audit_log_path": "destructive.audit_log_path",
+    }
+    destructive_payload: Dict[str, Any] = {}
+    if clear_all or "destructive" in normalized_keys:
+        destructive_payload = {key: "clear" for key in destructive_clear_keys}
+    else:
+        for key, label in destructive_clear_keys.items():
+            if key in normalized_keys or label in normalized_keys:
+                destructive_payload[key] = "clear"
+    if destructive_payload:
+        result["destructive"] = _setup_set_destructive_defaults(destructive_payload, dry_run)
+        if result["destructive"].get("error"):
+            return result["destructive"]
+        result["cleared"].extend(destructive_clear_keys[key] for key in destructive_payload)
+
     if clear_all or normalized_keys & {"updates", "updates.mode", "update_mode", "mcp_update_policy"}:
         result["updates"] = _setup_set_updates_defaults({"mode": "prompt"}, dry_run)
         if result["updates"].get("error"):
@@ -15853,12 +16146,13 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     Actions:
       schema() -> {defaults, actions}
       get_defaults() -> {defaults}
-      set_defaults(defaults?|media_analysis?|updates?|dry_run?) -> {defaults, changes}
+      set_defaults(defaults?|media_analysis?|updates?|destructive?|dry_run?) -> {defaults, changes}
       clear_defaults(keys?, dry_run?) -> {defaults, cleared}
 
     Current defaults:
       media_analysis.*: analysis, metadata, marker, reporting, and workflow defaults
       updates.*: MCP update policy, interval, and snooze defaults
+      destructive.*: confirm-token, safe-mode, and audit-log defaults
     """
     p = _params(params)
     if action in {"schema", "capabilities", "options"}:
@@ -15929,6 +16223,26 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
                     "current": _get_envelope_mode(),
                     "storage": _server_preferences_path(),
                 },
+                "destructive.require_confirm_token": {
+                    "description": "Require one-time confirmation tokens for registered high-risk destructive actions.",
+                    "values": [True, False],
+                    "storage": _media_analysis_preferences_path(),
+                },
+                "destructive.safe_mode": {
+                    "description": "When enabled, safe mode blocks high/dangerous destructive actions unless allow_risky_operation=true is passed.",
+                    "values": [True, False],
+                    "storage": _media_analysis_preferences_path(),
+                },
+                "destructive.audit_log": {
+                    "description": "Write JSONL security audit records for destructive operations.",
+                    "values": [True, False],
+                    "storage": _media_analysis_preferences_path(),
+                },
+                "destructive.audit_log_path": {
+                    "description": "Absolute path for the JSONL security audit log.",
+                    "values": "absolute or expandable path",
+                    "storage": _media_analysis_preferences_path(),
+                },
             },
         }
 
@@ -15957,6 +16271,7 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
                 for key, value in merged.items()
                 if key not in {"updates", "mcp_updates", "mcpUpdates", "dry_run", "dryRun"}
                 and key not in _general_keys
+                and key != "destructive"
             },
             **({
                 "timed_markers_default": _first_param(
@@ -16006,6 +16321,43 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
                 )
             } if any(key in merged for key in ("snooze_hours", "snoozeHours", "update_snooze_hours", "updateSnoozeHours")) else {}),
         }
+        destructive_defaults = {
+            **_setup_nested(merged, "destructive"),
+            **({
+                "require_confirm_token": _first_param(
+                    merged,
+                    "require_confirm_token",
+                    "requireConfirmToken",
+                    "confirm_token",
+                    "confirmToken",
+                    default=None,
+                )
+            } if any(key in merged for key in ("require_confirm_token", "requireConfirmToken", "confirm_token", "confirmToken")) else {}),
+            **({
+                "safe_mode": _first_param(
+                    merged,
+                    "safe_mode",
+                    "safeMode",
+                    default=None,
+                )
+            } if any(key in merged for key in ("safe_mode", "safeMode")) else {}),
+            **({
+                "audit_log": _first_param(
+                    merged,
+                    "audit_log",
+                    "auditLog",
+                    default=None,
+                )
+            } if any(key in merged for key in ("audit_log", "auditLog")) else {}),
+            **({
+                "audit_log_path": _first_param(
+                    merged,
+                    "audit_log_path",
+                    "auditLogPath",
+                    default=None,
+                )
+            } if any(key in merged for key in ("audit_log_path", "auditLogPath")) else {}),
+        }
 
         general_result = _setup_set_general_defaults(general_defaults, dry_run)
         if general_result.get("error"):
@@ -16016,9 +16368,16 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         update_result = _setup_set_updates_defaults(update_defaults, dry_run)
         if update_result.get("error"):
             return update_result
-        recognized = (bool(general_result.get("recognized"))
-                      or bool(media_result.get("recognized"))
-                      or bool(update_result.get("recognized")))
+        destructive_result = _setup_set_destructive_defaults(destructive_defaults, dry_run)
+        if destructive_result.get("error"):
+            return destructive_result
+        recognized = (
+            bool(general_result.get("recognized"))
+            or
+            bool(media_result.get("recognized"))
+            or bool(update_result.get("recognized"))
+            or bool(destructive_result.get("recognized"))
+        )
         if not recognized:
             return _err("set_defaults did not receive a recognized default to set")
 
@@ -16028,6 +16387,7 @@ def setup(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
                 "general": general_result,
                 "media_analysis": media_result,
                 "updates": update_result,
+                "destructive": destructive_result,
             },
             defaults=_setup_defaults_snapshot(),
         )
@@ -16133,6 +16493,11 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         — Write a Markdown or JSON audit report for an execution trace (no connection needed).
       clear_executions(dry_run?) -> {success, cleared}
         — Clear the in-memory execution trace buffer.
+      inspect_operation(tool?, target_action?, target_params?) -> {tool, action, risk, destructive, blast_radius, confirmation_required, snapshot_available, recognised, reasons, pre_state, pre_state_available}
+        — Name-based heuristic, NOT a simulation: it never touches the project and does not validate params. recognised=false means no rule matched; snapshot_available=null means rollback was not determined, not that none exists.
+        — Pre-flight risk assessment and blast radius inspection for any tool action before execution (no connection needed).
+      list_lifecycle_hooks() -> {success, hooks, count}
+        — List active agent tool execution lifecycle hooks and their enabled status (no connection needed).
     """
     p = _params(params)
 
@@ -16293,6 +16658,14 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
             return {"success": True, "dry_run": True, "count": len(_execution_trace.list_recent_executions(100))}
         res = _execution_trace.clear_executions()
         return res
+    if action == "inspect_operation":
+        target_tool = p.get("tool") or p.get("tool_name") or "timeline"
+        target_action = p.get("target_action") or p.get("action") or p.get("op") or "delete_clips"
+        target_params = p.get("target_params") or p.get("params") or {}
+        return _execution_lifecycle.inspect_operation(target_tool, target_action, target_params)
+    if action == "list_lifecycle_hooks":
+        hooks = _execution_lifecycle.list_lifecycle_hooks()
+        return {"success": True, "hooks": hooks, "count": len(hooks)}
 
     # Control-panel actions don't require Resolve to be running.
     if action == "open_control_panel":
@@ -16508,7 +16881,7 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         if err:
             return _err(err)
         return {"success": bool(r.ExportUserPreferencesPreset(clean["name"], clean["path"]))}
-    return _unknown(action, ["launch","runtime_mode","get_version","api_truth","check_version_support","verification_stats","job_status","list_jobs","get_execution_trace","get_execution","list_recent_executions","begin_execution","end_execution","export_execution_report","clear_executions","mcp_update_status","set_mcp_update_policy","ignore_mcp_update","snooze_mcp_update","clear_mcp_update_preferences","get_page","open_page","get_keyframe_mode","set_keyframe_mode","quit","get_fairlight_presets","set_high_priority","disable_background_tasks_for_current_session","list_user_preferences_presets","save_user_preferences_preset","load_user_preferences_preset","delete_user_preferences_preset","import_user_preferences_preset","export_user_preferences_preset","open_control_panel","control_panel_status","close_control_panel","save_state","restore_state"])
+    return _unknown(action, ["launch","runtime_mode","get_version","api_truth","check_version_support","verification_stats","job_status","list_jobs","get_execution_trace","get_execution","list_recent_executions","begin_execution","end_execution","export_execution_report","clear_executions","inspect_operation","list_lifecycle_hooks","mcp_update_status","set_mcp_update_policy","ignore_mcp_update","snooze_mcp_update","clear_mcp_update_preferences","get_page","open_page","get_keyframe_mode","set_keyframe_mode","quit","get_fairlight_presets","set_high_priority","disable_background_tasks_for_current_session","list_user_preferences_presets","save_user_preferences_preset","load_user_preferences_preset","delete_user_preferences_preset","import_user_preferences_preset","export_user_preferences_preset","open_control_panel","control_panel_status","close_control_panel","save_state","restore_state"])
 
 
 # ─── V2 C4: Per-field corrections with provenance + changelog ────────────────
@@ -20011,16 +20384,19 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
                                 "issue #164)."
                             )
             else:
-                if status.get("JobStatus") == "Complete":
+                if _render_job_completed(status):
                     warnings.append(
-                        "JobStatus is Complete but the output file does not exist."
+                        f"JobStatus is {job_status!r} (complete) but the output "
+                        "file does not exist."
                     )
-        if job_status and job_status != "Complete":
+        if job_status and not _render_job_completed(status):
             # Spotted live: a Failed job that wrote a stub file otherwise
             # produced verified:true — a duration ratio means nothing when
-            # Resolve itself says the job did not complete.
+            # Resolve itself says the job did not complete. Decided on the
+            # locale-independent fields, not the JobStatus word (issue #191).
             warnings.append(
-                f"JobStatus is {job_status!r}, not Complete"
+                f"JobStatus is {job_status!r} at "
+                f"{status.get('CompletionPercentage')}%, not complete"
                 + (f": {status.get('Error')}" if status.get("Error") else "")
             )
         result["warnings"] = warnings
@@ -24099,24 +24475,11 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                     structural_diff if include_details
                     else _compact_structural_diff(structural_diff)
                 ),
-                "audio_accounting": {
-                    "planned_audio_ranges": audio_keep_ranges,
-                    "planned_video_ranges": video_keep_ranges,
-                    # variant_* count placed items; variant["audio"] counts requested ranges.
-                    "variant_audio_items": sum(
-                        1 for it in (variant.get("items") or [])
-                        if (it.get("range") or {}).get("media_type") == 2
-                    ),
-                    "variant_video_items": sum(
-                        1 for it in (variant.get("items") or [])
-                        if (it.get("range") or {}).get("media_type") == 1
-                    ),
-                    "note": (
-                        "Variant carries audio mirrored from the video cuts."
-                        if audio_keep_ranges
-                        else "Variant is VIDEO-ONLY (silent) — re-plan with include_audio=True for sound."
-                    ),
-                },
+                # variant_* count PLACED items, re-read from the variant;
+                # variant["audio"] counts requested ranges.
+                "audio_accounting": _variant_audio_accounting(
+                    variant, planned_video=video_keep_ranges, planned_audio=audio_keep_ranges,
+                ),
             },
             "plan_id": plan.get("plan_id"),
         }
@@ -24235,23 +24598,9 @@ def edit_engine(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
                     structural_diff if include_details
                     else _compact_structural_diff(structural_diff)
                 ),
-                "audio_accounting": {
-                    "planned_audio_ranges": audio_keep_ranges,
-                    "planned_video_ranges": video_keep_ranges,
-                    "variant_audio_items": sum(
-                        1 for it in (variant.get("items") or [])
-                        if (it.get("range") or {}).get("media_type") == 2
-                    ),
-                    "variant_video_items": sum(
-                        1 for it in (variant.get("items") or [])
-                        if (it.get("range") or {}).get("media_type") == 1
-                    ),
-                    "note": (
-                        "Variant carries audio mirrored from the video cuts."
-                        if audio_keep_ranges
-                        else "Variant is VIDEO-ONLY (silent) — re-plan with include_audio=True for sound."
-                    ),
-                },
+                "audio_accounting": _variant_audio_accounting(
+                    variant, planned_video=video_keep_ranges, planned_audio=audio_keep_ranges,
+                ),
             },
             "plan_id": plan.get("plan_id"),
         }

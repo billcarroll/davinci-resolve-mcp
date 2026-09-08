@@ -277,6 +277,32 @@ Example trace shape returned by `resolve_control(action="get_execution_trace")`:
   structured output, `include_steps: false` for a shorter summary, or
   `overwrite: true` to replace an existing report.
 - **`clear_executions(dry_run?)`**: Clears the in-memory execution trace buffer.
+- **`inspect_operation(tool?, target_action?, target_params?)`**: Evaluates operation risk
+  level (`low`, `medium`, `high`, `critical`), destructive potential, confirmation
+  requirements, and blast radius scope before executing an action.
+
+  **It is a heuristic over action names, not a simulation.** It does not touch
+  the project, does not validate your parameters, and cannot tell you whether
+  the clip ids you are holding exist. Read three fields before trusting it:
+  `recognised: false` means no rule matched and the levels are name-based
+  defaults rather than a finding; `snapshot_available: null` means rollback
+  availability was not determined, never that there is none; and
+  `pre_state_available` separates "no project open" from "state never read".
+  For an actual preview, use the action's own `dry_run` where it has one.
+  Where it has none, an explicit `dry_run=true` on a registered destructive
+  action is refused with `DRY_RUN_UNAVAILABLE` (`status: dry_run_unavailable`,
+  `simulated: false`, `executed: false`, plus the same static risk block)
+  before any archive, state lookup, or handler execution. Until v2.211.0 the
+  flag was silently ignored on those actions and the mutation ran; the
+  actions that do honour it are listed in `NATIVE_DRY_RUN_ACTIONS`
+  (`src/utils/destructive_hook.py`) and pinned to the handlers by a test.
+- **`list_lifecycle_hooks()`**: Returns active execution lifecycle pipeline hooks
+  (`risk_classification`, `resolve_state_inspection`, `readback_verification`,
+  `drift_detection`, `provenance_trace`). All of them observe; none replaces a
+  tool result. `dry_run` is therefore never answered on a handler's behalf:
+  an action with a native dry-run path runs it, and every other registered
+  destructive action refuses the flag instead of either simulating or
+  executing.
 
 Explicit correlation is also supported per-call: pass `params={"execution_id": ...}`
 or `params={"trace_id": ...}` in any tool call to associate it with a specific trace.
